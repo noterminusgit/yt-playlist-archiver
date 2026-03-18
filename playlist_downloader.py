@@ -13,31 +13,38 @@ Example:
     python playlist_downloader.py @username
     python playlist_downloader.py https://www.youtube.com/@username
     python playlist_downloader.py UCxxxxxxxxxxxxxx ./downloads
+
+Requires YOUTUBE_API_KEY environment variable to be set.
 """
 
 import os
 import sys
 import json
+import re
 import time
 import shutil
 import argparse
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 from datetime import datetime
 import yt_dlp
+import googleapiclient.discovery
 
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('playlist_downloader.log'),
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger(__name__)
+
+
+def _configure_logging():
+    """Configure logging with file and stream handlers. Called from main() only."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('playlist_downloader.log'),
+            logging.StreamHandler()
+        ]
+    )
 
 
 class PlaylistDownloader:
@@ -52,16 +59,59 @@ class PlaylistDownloader:
         Initialize the playlist downloader.
 
         Args:
-            channel_url: YouTube channel URL or ID
+            channel_url: YouTube channel URL, handle, or ID
             output_dir: Directory to save downloaded videos
         """
         self.channel_url = channel_url
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+        # YouTube Data API setup
+        api_key = os.environ.get('YOUTUBE_API_KEY')
+        if not api_key:
+            raise ValueError("YOUTUBE_API_KEY environment variable is required")
+        self.youtube = googleapiclient.discovery.build('youtube', 'v3', developerKey=api_key)
+        self.channel_id = self._resolve_channel_id(channel_url)
+
         # Global index to track all downloaded videos and their locations
         self.global_index_path = self.output_dir / self.GLOBAL_INDEX_FILE
         self.global_index = self._load_global_index()
+
+    def _resolve_channel_id(self, channel_url: str) -> str:
+        """
+        Resolve a channel URL/handle to a channel ID.
+
+        Handles:
+            - @username or https://youtube.com/@username
+            - UCxxxxxxxx (raw channel ID)
+            - https://youtube.com/channel/UCxxxxxxxx
+
+        Returns:
+            The UC... channel ID string.
+        """
+        # Raw channel ID
+        if channel_url.startswith('UC') and '/' not in channel_url:
+            return channel_url
+
+        # URL with channel ID
+        match = re.search(r'/channel/(UC[a-zA-Z0-9_-]+)', channel_url)
+        if match:
+            return match.group(1)
+
+        # Handle (@username)
+        handle_match = re.search(r'@([\w.-]+)', channel_url)
+        if handle_match:
+            handle = handle_match.group(1)
+            response = self.youtube.channels().list(
+                part='snippet',
+                forHandle=handle
+            ).execute()
+
+            if response.get('items'):
+                return response['items'][0]['id']
+            raise ValueError(f"Could not resolve handle @{handle} to a channel ID")
+
+        raise ValueError(f"Could not parse channel URL: {channel_url}")
 
     def _load_global_index(self) -> Dict:
         """Load the global video index from disk."""
@@ -101,107 +151,94 @@ class PlaylistDownloader:
 
     def get_all_playlists(self) -> List[Dict]:
         """
-        Fetch all playlists from the channel.
+        Fetch all playlists from the channel using YouTube Data API v3.
 
         Returns:
             List of playlist information dictionaries
         """
-        logger.info(f"Fetching playlists from channel: {self.channel_url}")
+        logger.info(f"Fetching playlists for channel: {self.channel_id}")
 
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': True,
-        }
+        playlists = []
+        page_token = None
 
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                # Extract channel info
-                channel_info = ydl.extract_info(self.channel_url, download=False)
+            while True:
+                request = self.youtube.playlists().list(
+                    part='snippet',
+                    channelId=self.channel_id,
+                    maxResults=50,
+                    pageToken=page_token
+                )
+                response = request.execute()
 
-                if not channel_info:
-                    logger.error("Could not fetch channel information")
-                    return []
+                for item in response.get('items', []):
+                    playlists.append({
+                        'id': item['id'],
+                        'title': item['snippet']['title'],
+                        'url': f"https://www.youtube.com/playlist?list={item['id']}"
+                    })
 
-                # Get playlists
-                playlists = []
+                page_token = response.get('nextPageToken')
+                if not page_token:
+                    break
 
-                # Try to get playlists from the channel
-                if 'entries' in channel_info:
-                    for entry in channel_info['entries']:
-                        if entry.get('_type') == 'playlist':
-                            playlists.append({
-                                'id': entry.get('id'),
-                                'title': entry.get('title'),
-                                'url': entry.get('url') or f"https://www.youtube.com/playlist?list={entry.get('id')}"
-                            })
-
-                # Alternative: Extract playlists from channel tabs
-                channel_id = channel_info.get('channel_id') or channel_info.get('id')
-                if channel_id and not playlists:
-                    playlists_url = f"https://www.youtube.com/channel/{channel_id}/playlists"
-                    playlists_info = ydl.extract_info(playlists_url, download=False)
-
-                    if playlists_info and 'entries' in playlists_info:
-                        for entry in playlists_info['entries']:
-                            if entry:
-                                playlists.append({
-                                    'id': entry.get('id'),
-                                    'title': entry.get('title'),
-                                    'url': entry.get('url') or f"https://www.youtube.com/playlist?list={entry.get('id')}"
-                                })
-
-                logger.info(f"Found {len(playlists)} playlists")
-                return playlists
+            logger.info(f"Found {len(playlists)} playlists")
+            return playlists
 
         except Exception as e:
             logger.error(f"Error fetching playlists: {e}")
             return []
 
-    def get_playlist_videos(self, playlist_url: str) -> List[Dict]:
+    def get_playlist_videos(self, playlist_id: str) -> List[Dict]:
         """
-        Get all videos from a playlist.
+        Get all videos from a playlist using YouTube Data API v3.
 
         Args:
-            playlist_url: URL of the playlist
+            playlist_id: YouTube playlist ID
 
         Returns:
             List of video information dictionaries
         """
-        logger.info(f"Fetching videos from playlist: {playlist_url}")
+        logger.info(f"Fetching videos from playlist: {playlist_id}")
 
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'extract_flat': True,
-        }
+        videos = []
+        page_token = None
 
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                playlist_info = ydl.extract_info(playlist_url, download=False)
+            while True:
+                request = self.youtube.playlistItems().list(
+                    part='snippet,status,contentDetails',
+                    playlistId=playlist_id,
+                    maxResults=50,
+                    pageToken=page_token
+                )
+                response = request.execute()
 
-                if not playlist_info or 'entries' not in playlist_info:
-                    logger.warning(f"No videos found in playlist")
-                    return []
+                for item in response.get('items', []):
+                    video_id = item['snippet']['resourceId']['videoId']
+                    title = item['snippet']['title']
+                    unavailable = title in ('Private video', 'Deleted video')
 
-                videos = []
-                for idx, entry in enumerate(playlist_info['entries']):
-                    if entry:
-                        videos.append({
-                            'id': entry.get('id'),
-                            'title': entry.get('title'),
-                            'url': entry.get('url') or f"https://www.youtube.com/watch?v={entry.get('id')}",
-                            'playlist_index': idx
-                        })
+                    videos.append({
+                        'id': video_id,
+                        'title': title,
+                        'url': f"https://www.youtube.com/watch?v={video_id}",
+                        'playlist_index': item['snippet']['position'],
+                        'unavailable': unavailable
+                    })
 
-                logger.info(f"Found {len(videos)} videos in playlist")
-                return videos
+                page_token = response.get('nextPageToken')
+                if not page_token:
+                    break
+
+            logger.info(f"Found {len(videos)} videos in playlist")
+            return videos
 
         except Exception as e:
             logger.error(f"Error fetching playlist videos: {e}")
             return []
 
-    def download_video(self, video_url: str, output_path: Path, video_id: str) -> Optional[str]:
+    def download_video(self, video_url: str, output_path: Path, video_id: str, position: int) -> Optional[str]:
         """
         Download a single video with retry logic.
 
@@ -209,13 +246,14 @@ class PlaylistDownloader:
             video_url: URL of the video
             output_path: Directory to save the video
             video_id: YouTube video ID
+            position: 0-based position for filename numbering
 
         Returns:
             Path to downloaded file if successful, None otherwise
         """
         ydl_opts = {
             'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-            'outtmpl': str(output_path / '%(title)s.%(ext)s'),
+            'outtmpl': str(output_path / f'{position + 1:03d} - %(title)s.%(ext)s'),
             'quiet': False,
             'no_warnings': False,
             'ignoreerrors': False,
@@ -454,22 +492,59 @@ class PlaylistDownloader:
                 'videos': {}
             }
 
-        # Get all videos in the playlist
-        videos = self.get_playlist_videos(playlist_url)
+        # Get all videos from API
+        videos = self.get_playlist_videos(playlist_id)
+
+        # Build position map from existing metadata: {position: video_id}
+        position_map = {}
+        for vid_id, vid_data in metadata['videos'].items():
+            if 'position' in vid_data:
+                position_map[vid_data['position']] = vid_id
 
         # Process each video
         for video in videos:
             video_id = video['id']
             video_title = video['title']
             video_url = video['url']
+            api_position = video['playlist_index']
+            is_unavailable = video.get('unavailable', False)
 
-            # Check if video is already downloaded
+            # Determine position
+            if video_id in metadata['videos'] and 'position' in metadata['videos'][video_id]:
+                # Known video - use stored position
+                assigned_position = metadata['videos'][video_id]['position']
+            else:
+                # New video - try API position first
+                if api_position not in position_map or position_map.get(api_position) == video_id:
+                    assigned_position = api_position
+                else:
+                    # Conflict - assign next available position
+                    assigned_position = max(position_map.keys()) + 1 if position_map else 0
+                position_map[assigned_position] = video_id
+
+            video['playlist_index'] = assigned_position
+
+            # Check if already downloaded
             if video_id in metadata['videos']:
                 existing_status = metadata['videos'][video_id].get('status')
                 if existing_status == 'downloaded':
                     logger.info(f"Video {video_id} already downloaded, skipping")
                     video['status'] = 'downloaded'
+                    metadata['videos'][video_id]['position'] = assigned_position
                     continue
+
+            # Handle unavailable videos
+            if is_unavailable:
+                metadata['videos'][video_id] = {
+                    'title': video_title,
+                    'url': video_url,
+                    'status': 'unavailable',
+                    'position': assigned_position
+                }
+                video['status'] = 'unavailable'
+                with open(metadata_path, 'w', encoding='utf-8') as f:
+                    json.dump(metadata, f, indent=2, ensure_ascii=False)
+                continue
 
             # Check if video exists in another playlist
             if video_id in self.global_index:
@@ -481,7 +556,8 @@ class PlaylistDownloader:
                         'url': video_url,
                         'status': 'downloaded',
                         'downloaded_at': datetime.now().isoformat(),
-                        'copied_from': self.global_index[video_id]['files'][0]
+                        'copied_from': self.global_index[video_id]['files'][0],
+                        'position': assigned_position
                     }
                     video['status'] = 'downloaded'
 
@@ -500,7 +576,7 @@ class PlaylistDownloader:
                     continue
 
             # Download the video
-            downloaded_file = self.download_video(video_url, playlist_dir, video_id)
+            downloaded_file = self.download_video(video_url, playlist_dir, video_id, assigned_position)
 
             if downloaded_file:
                 # Update metadata
@@ -509,7 +585,8 @@ class PlaylistDownloader:
                     'url': video_url,
                     'status': 'downloaded',
                     'downloaded_at': datetime.now().isoformat(),
-                    'file': downloaded_file
+                    'file': downloaded_file,
+                    'position': assigned_position
                 }
                 video['status'] = 'downloaded'
 
@@ -527,7 +604,8 @@ class PlaylistDownloader:
                     'title': video_title,
                     'url': video_url,
                     'status': 'failed',
-                    'failed_at': datetime.now().isoformat()
+                    'failed_at': datetime.now().isoformat(),
+                    'position': assigned_position
                 }
                 video['status'] = 'failed'
 
@@ -566,6 +644,8 @@ class PlaylistDownloader:
 
 def main():
     """Main entry point for the script."""
+    _configure_logging()
+
     parser = argparse.ArgumentParser(
         description='Download all YouTube playlists from a channel',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -574,6 +654,8 @@ Examples:
   %(prog)s @username
   %(prog)s https://www.youtube.com/@username
   %(prog)s UCxxxxxxxxxxxxxx ./downloads
+
+Requires YOUTUBE_API_KEY environment variable to be set.
         """
     )
 
